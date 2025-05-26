@@ -8,6 +8,12 @@ from tqdm import tqdm
 from openai import OpenAI
 import chardet
 import re
+import sys
+import colorama
+from colorama import Fore, Style
+
+# Initialize colorama for cross-platform colored terminal output
+colorama.init()
 
 # Configure logging
 os.makedirs('logs', exist_ok=True)
@@ -36,6 +42,8 @@ def parse_arguments():
                         help='Create a backup of the original file')
     parser.add_argument('--encoding', '-e', default=None,
                         help='Force a specific encoding (e.g., latin-1, cp1252)')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='Minimal console output (hide detailed processing info)')
     return parser.parse_args()
 
 def detect_encoding(file_path):
@@ -62,6 +70,18 @@ def clean_text(text):
     # Rejoin with commas
     return ','.join(cleaned_parts)
 
+def print_header():
+    """Print a formatted header for the application."""
+    print(f"\n{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'Book Information Enrichment Tool':^80}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}\n")
+
+def clear_current_line():
+    """Clear the current line in the terminal."""
+    sys.stdout.write('\r' + ' ' * 100)
+    sys.stdout.write('\r')
+    sys.stdout.flush()
+
 class BookInfoUpdater:
     """Class to update book information using OpenAI API."""
     
@@ -74,6 +94,7 @@ class BookInfoUpdater:
         self.start_row = args.start
         self.delay = args.delay
         self.create_backup = args.backup
+        self.quiet_mode = args.quiet
         self.max_retries = 3
         self.retry_delay = 2  # seconds
         
@@ -99,29 +120,25 @@ class BookInfoUpdater:
         """Create the API prompt for a book."""
         return [
             {"role": "system", "content": """
-You are a helpful literary assistant. I will give you the title and author of a book. 
-You must respond with one single line only in the following comma-separated format without brackets:
-Publication Date,Genre,Literary Form,Reading Level,Word Count
+You are a literary classifier. I will give you a book title and author. 
+Respond with ONE SINGLE LINE in comma-separated format:
+Publication Date,Literary Form,Reading Level,Word Count
 
-Example response format: "1925,Fiction,Novel,College or Adult General,95000"
+Example for Animal Farm by Orwell: "1945,Novella,High School,29966"
 
-Follow these rules exactly:
-- Do not include any extra text, notes, or explanations.
-- Do not add line breaks or labels.
-- Use only one line of plain text.
-- Do not include brackets in your response.
-- Use only English alphanumeric characters in each field (commas are allowed as separators).
-- Make your best reasonable guess for all fields, especially word count.
-
-For Literary Form, choose ONLY ONE of the following:
-Allegory, Autobiography, Biography, Epic, Essay, Fable, Fairy tale, Frame story, 
-Graphic novel, Memoir, Novel, Novella, Philosophical dialogue, Play, Poem, 
-Prose Poetry, Satire, Short Story, Treatise
-
-For Reading Level, choose ONLY ONE of the following:
-Early Elementary, Upper Elementary, Middle School, High School, 
-College or Adult General, College or Adult Advanced, Academic or Scholarly
-            """},
+Rules:
+- Use ONLY English alphanumeric characters and spaces (no special characters)
+- Use commas ONLY as field separators
+- Choose ONE Literary Form from this list:
+  Autobiography, Biography, Epic Poem, Folk Tale, Graphic Novel, Memoir, Novel, 
+  Novella, NonFiction Novel, NonFiction Novella, Play, Poem, Satire, Short Story, Treatise
+- Only use "Other Fiction" or "Other NonFiction" if the work truly doesn't fit any other category
+- Choose ONE Reading Level from this list:
+  Early Elementary, Upper Elementary, Middle School, High School, 
+  College or Adult General, College or Adult Advanced, Academic or Scholarly
+- For Word Count, provide the exact word count based on your training or an estimate if the exact count is unknown
+"""
+            },
             {"role": "user", "content": f"{title},{author}"}
         ]
 
@@ -140,8 +157,11 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
             # Extract the response content
             api_response = response.choices[0].message.content.strip()
             
-            # Display the raw API response in the console
-            print(f"\n[API Response] {title} by {author}: {api_response}")
+            # Display the raw API response in the console if not in quiet mode
+            if not self.quiet_mode:
+                clear_current_line()
+                print(f"{Fore.GREEN}[API Response]{Style.RESET_ALL} {api_response}")
+            
             logger.info(f"API returned: {api_response}")
             
             # Clean the response
@@ -152,14 +172,22 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
         except Exception as e:
             logger.error(f"Error processing '{title}' by {author}: {str(e)}")
             
+            if not self.quiet_mode:
+                clear_current_line()
+                print(f"{Fore.RED}[Error]{Style.RESET_ALL} {str(e)}")
+            
             if retry_count < self.max_retries:
                 retry_seconds = self.retry_delay * (2 ** retry_count)  # Exponential backoff
                 logger.info(f"Retrying in {retry_seconds} seconds... (Attempt {retry_count + 1}/{self.max_retries})")
+                
+                if not self.quiet_mode:
+                    print(f"{Fore.YELLOW}[Retry]{Style.RESET_ALL} Waiting {retry_seconds}s... ({retry_count + 1}/{self.max_retries})")
+                
                 time.sleep(retry_seconds)
                 return self.get_book_info(title, author, retry_count + 1)
             else:
                 logger.error(f"Failed to process '{title}' after {self.max_retries} retries")
-                return "Unknown,Unknown,Novel,College or Adult General,Unknown"
+                return "Unknown,Novel,College or Adult General,Unknown"
 
     def process_books(self):
         """Process each book in the CSV file and update it with enriched information."""
@@ -180,6 +208,7 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
                 import shutil
                 shutil.copy2(self.input_file, self.backup_file)
                 logger.info(f"Created backup at {self.backup_file}")
+                print(f"{Fore.BLUE}[Info]{Style.RESET_ALL} Created backup at {self.backup_file}")
             
             # Process file line by line
             with open(self.input_file, 'r', encoding=self.encoding, errors='replace') as input_file, \
@@ -192,8 +221,9 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
                 progress_bar = tqdm(
                     enumerate(csv_reader, 1), 
                     total=row_count, 
-                    desc="Processing books",
-                    initial=self.start_row - 1 if self.start_row > 1 else 0
+                    desc=f"{Fore.CYAN}Processing{Style.RESET_ALL}",
+                    initial=self.start_row - 1 if self.start_row > 1 else 0,
+                    bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
                 )
                 
                 for row_num, row in progress_bar:
@@ -208,8 +238,14 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
                         
                         logger.info(f"Processing book {row_num}/{row_count}: '{title}' by {author}")
                         
-                        # Display the processing status with more detail
-                        print(f"\n[Processing {row_num}/{row_count}] '{title}' by {author}")
+                        # Display the processing status with more detail if not in quiet mode
+                        if not self.quiet_mode:
+                            # Update progress bar description
+                            progress_bar.set_description(f"{Fore.CYAN}Processing{Style.RESET_ALL} '{title}' by {author}")
+                            
+                            # Save cursor position
+                            clear_current_line()
+                            print(f"{Fore.BLUE}[Book {row_num}/{row_count}]{Style.RESET_ALL} '{title}' by {author}")
                         
                         # Get enriched book information
                         api_response = self.get_book_info(title, author)
@@ -217,8 +253,10 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
                         # Combine original title and author with API response
                         combined_row = [title, author] + api_response.split(',')
                         
-                        # Display the final result
-                        print(f"[Updated] {','.join(combined_row)}")
+                        # Display the final result if not in quiet mode
+                        if not self.quiet_mode:
+                            clear_current_line()
+                            print(f"{Fore.GREEN}[Updated]{Style.RESET_ALL} {title},{author},{api_response}")
                         
                         # Write the combined row
                         csv_writer.writerow(combined_row)
@@ -233,14 +271,32 @@ College or Adult General, College or Adult Advanced, Academic or Scholarly
             os.replace(self.temp_file, self.input_file)
             logger.info(f"Successfully updated all books in {self.input_file}")
             
+            # Print completion message
+            print(f"\n{Fore.GREEN}Success!{Style.RESET_ALL} Updated all books in {self.input_file}")
+            
         except Exception as e:
             logger.error(f"An error occurred during processing: {str(e)}")
+            print(f"\n{Fore.RED}Error:{Style.RESET_ALL} {str(e)}")
+            
             if os.path.exists(self.temp_file):
                 logger.info(f"Temp file '{self.temp_file}' was not deleted due to an error")
+                print(f"{Fore.YELLOW}Note:{Style.RESET_ALL} Temp file '{self.temp_file}' was preserved for recovery")
 
 def main():
     """Main entry point for the script."""
     args = parse_arguments()
+    
+    # Print header
+    print_header()
+    
+    # Display configuration
+    print(f"{Fore.BLUE}Configuration:{Style.RESET_ALL}")
+    print(f"  Input file:  {args.input}")
+    print(f"  Model:       {args.model}")
+    print(f"  Starting at: Row {args.start}")
+    print(f"  Delay:       {args.delay}s between API calls")
+    print(f"  Backup:      {'Yes' if args.backup else 'No'}")
+    print(f"  Mode:        {'Quiet' if args.quiet else 'Verbose'}\n")
     
     logger.info("Starting book information enrichment process")
     logger.info(f"Using model: {args.model}")
@@ -251,6 +307,18 @@ def main():
     updater.process_books()
     
     logger.info("Book information enrichment process completed")
+    print(f"\n{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}Process completed successfully!{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}\n")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n{Fore.YELLOW}Process interrupted by user.{Style.RESET_ALL}")
+        logger.info("Process interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n\n{Fore.RED}Fatal error: {str(e)}{Style.RESET_ALL}")
+        logger.error(f"Fatal error: {str(e)}")
+        sys.exit(1)
